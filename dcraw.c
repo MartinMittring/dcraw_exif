@@ -35,6 +35,22 @@
 #define ftello _ftelli64
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+// Changes by Martin Mittring
+// to resolve warnings/errors when compiling with Visual Studio 2012 or newer
+#ifdef _MSC_VER
+#pragma warning(disable:4305)
+#pragma warning(disable:4018)
+#pragma warning(disable:4244)
+#include <direct.h> // _getcwd()
+#include <io.h>
+#define getcwd _getcwd
+#define setmode _setmode
+#define isatty _isatty
+#endif
+#include <assert.h>
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 #define DCRAW_VERSION "9.19"
 
 #ifndef _GNU_SOURCE
@@ -146,9 +162,11 @@ ushort white[8][8], curve[0x10000], cr2_slice[3], sraw_mul[4];
 double pixel_aspect, aber[4]={1,1,1,1}, gamm[6]={ 0.45,4.5,0,0,0,0 };
 float bright=1, user_mul[4]={0,0,0,0}, threshold=0;
 int mask[8][4];
+int exif_focal_data[6];	// FocalPlaneXResolution, FocalPlaneYResolution, FocalPlaneResolutionUnit
 int half_size=0, four_color_rgb=0, document_mode=0, highlight=0;
 int verbose=0, use_auto_wb=0, use_camera_wb=0, use_camera_matrix=-1;
 int output_color=1, output_bps=8, output_tiff=0, med_passes=0;
+int crop_x=0, crop_y=0, down_sample=0;
 int no_auto_bright=0;
 unsigned greybox[4] = { 0, 0, UINT_MAX, UINT_MAX };
 float cam_mul[4], pre_mul[4], cmatrix[3][4], rgb_cam[3][4];
@@ -4820,6 +4838,69 @@ void CLASS recover_highlights()
 }
 #undef SCALE
 
+void downsample()
+{
+	// can be optimized
+	int i, row, col;
+	ushort wide, high, (*img)[4], (*pix)[4];
+	int dx, dy;
+
+	printf("downsample()\n");
+
+	wide = max(1, width / 2);
+	high = max(1, height/ 2);
+	img = (ushort(*)[4]) calloc(high, wide*sizeof *img);
+
+	for (row = 0; row < high; row++)
+	for (col = 0; col < wide; col++)
+	for (i = 0; i < colors; i++)
+	{
+		unsigned int sum = 0, count = 0;
+
+		for(dy = row * 2; dy < row * 2 + 2; ++dy)
+		for(dx = col * 2; dx < col * 2 + 2; ++dx)
+		{
+			if (dy > height || dx > width)
+				continue;
+
+			pix = image + dy*width + dx;
+			sum += pix[0][i];
+			++count;
+		}
+
+		img[row*wide + col][i] = sum / count;
+	}
+	free(image);
+	width = wide;
+	height = high;
+	image = img;
+}
+
+void croppixels()
+{
+	int i, row, col;
+	ushort wide, high, (*img)[4], (*pix)[4];
+
+	printf("croppixels(%d,%d)\n", crop_x, crop_y);
+
+	wide = max(1, width - crop_x * 2);
+	high = max(1, height - crop_y * 2);
+	img = (ushort(*)[4]) calloc(high, wide*sizeof *img);
+
+	for (row = 0; row < high; row++)
+	for (col = 0; col < wide; col++)
+	for (i = 0; i < colors; i++)
+	{
+		pix = image + (row+crop_y)*width + (col+crop_x);
+
+		img[row*wide + col][i] = pix[0][i];
+	}
+	free(image);
+	width = wide;
+	height = high;
+	image = img;
+}
+
 void CLASS tiff_get (unsigned base,
 	unsigned *tag, unsigned *type, unsigned *len, unsigned *save)
 {
@@ -5209,6 +5290,20 @@ void CLASS parse_exif (int base)
       case 37500:  parse_makernote (base, 0);		break;
       case 40962:  if (kodak) raw_width  = get4();	break;
       case 40963:  if (kodak) raw_height = get4();	break;
+      case 0xA20E: // MM FocalPlaneXResolution
+		assert(type == 5);
+		exif_focal_data[0] = (unsigned int)get4();
+		exif_focal_data[1] = (unsigned int)get4();
+		break;
+      case 0xA20F: // MM FocalPlaneYResolution
+		assert(type == 5);
+		exif_focal_data[2] = (unsigned int)get4();
+		exif_focal_data[3] = (unsigned int)get4();
+		break;
+      case 0xA210: // MM FocalPlaneResolutionUnit
+		assert(type == 3);
+		exif_focal_data[4] = (unsigned int)get2();
+		break;
       case 41730:
 	if (get4() == 0x20002)
 	  for (exif_cfa=c=0; c < 8; c+=2)
@@ -8942,11 +9037,11 @@ struct tiff_hdr {
   struct tiff_tag tag[23];
   int nextifd;
   ushort pad2, nexif;
-  struct tiff_tag exif[4];
+  struct tiff_tag exif[4 + 3];	// MM FocalPlaneXResolution, FocalPlaneYResolution, FocalPlaneResolutionUnit
   ushort pad3, ngps;
   struct tiff_tag gpst[10];
   short bps[4];
-  int rat[10];
+  int rat[10 + 2 * 2];			// MM FocalPlaneXResolution, FocalPlaneYResolution
   unsigned gps[26];
   char desc[512], make[64], model[64], soft[32], date[20], artist[64];
 };
@@ -9014,6 +9109,12 @@ void CLASS tiff_head (struct tiff_hdr *th, int full)
   tiff_set (&th->nexif, 33437, 5, 1, TOFF(th->rat[6]));
   tiff_set (&th->nexif, 34855, 3, 1, iso_speed);
   tiff_set (&th->nexif, 37386, 5, 1, TOFF(th->rat[8]));
+
+  // MM FocalPlaneXResolution, FocalPlaneYResolution, FocalPlaneResolutionUnit
+  tiff_set(&th->nexif, 0xA20E, 5, 1, TOFF(th->rat[10]));			// FocalPlaneXResolution
+  tiff_set(&th->nexif, 0xA20F, 5, 1, TOFF(th->rat[12]));			// FocalPlaneYResolution
+  tiff_set(&th->nexif, 0xA210, 3, 1, exif_focal_data[4]);			// FocalPlaneResolutionUnit
+
   if (gpsdata[1]) {
     tiff_set (&th->ntag, 34853, 4, 1, TOFF(th->ngps));
     tiff_set (&th->ngps,  0, 1,  4, 0x202);
@@ -9034,6 +9135,10 @@ void CLASS tiff_head (struct tiff_hdr *th, int full)
   th->rat[4] *= shutter;
   th->rat[6] *= aperture;
   th->rat[8] *= focal_len;
+
+  // MM FocalPlaneXResolution, FocalPlaneYResolution
+  FORC(4) th->rat[10 + c] = exif_focal_data[c];
+
   strncpy (th->desc, desc, 512);
   strncpy (th->make, make, 64);
   strncpy (th->model, model, 64);
@@ -9180,7 +9285,9 @@ int CLASS main (int argc, const char **argv)
     puts(_("-s [0..N-1] Select one raw image or \"all\" from each file"));
     puts(_("-6        Write 16-bit instead of 8-bit"));
     puts(_("-4        Linear 16-bit, same as \"-6 -W -g 1 1\""));
-    puts(_("-T        Write TIFF instead of PPM"));
+	puts(_("-T        Write TIFF instead of PPM"));
+	puts(_("-Q [0-3]  0:normal, 1:half res, 2:quarter res, 3: .. (after crop)"));
+	puts(_("-Z <x> <y> crop border pixels (done by Canon tools e.g. -Z 18 15)"));
     puts("");
     return 1;
   }
@@ -9241,7 +9348,9 @@ int CLASS main (int argc, const char **argv)
       case 'd':  document_mode++;
       case 'j':  use_fuji_rotate   = 0;  break;
       case 'W':  no_auto_bright    = 1;  break;
-      case 'T':  output_tiff       = 1;  break;
+	  case 'T':  output_tiff       = 1;  break;
+	  case 'Q':  down_sample = atoi(argv[arg++]);  break;
+	  case 'Z':  crop_x = atoi(argv[arg++]); crop_y = atoi(argv[arg++]);  break;
       case '4':  gamm[0] = gamm[1] =
 		 no_auto_bright    = 1;
       case '6':  output_bps       = 16;  break;
@@ -9481,6 +9590,19 @@ next:
     if (!is_foveon && colors == 3) median_filter();
     if (!is_foveon && highlight == 2) blend_highlights();
     if (!is_foveon && highlight > 2) recover_highlights();
+	if(crop_x || crop_y)
+	{
+		// first we crop (likely needed because the sensor borders can have issues), then we downsample (so the size is the same in distance)
+		croppixels();
+	}
+	{
+		int pass;
+
+		for(pass = 0; pass < down_sample; ++pass)
+		{
+			downsample();
+		}
+	}
     if (use_fuji_rotate) fuji_rotate();
 #ifndef NO_LCMS
     if (cam_profile) apply_profile (cam_profile, out_profile);
