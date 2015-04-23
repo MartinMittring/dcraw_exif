@@ -3,7 +3,7 @@ This project is not part of UnrealEngine but it was used for the UnrealEngine Ki
   https://www.youtube.com/watch?v=_zVddsYKZnw
   https://www.youtube.com/watch?v=clakekAHQx0
 
-The code was tested with multiple Canon cameras using the .CRW (raw) format as input.
+The code was tested with multiple Canon cameras using the .CR2 (raw) format as input.
 
 Typical commandline:
   dcraw -4 -w -o 1 -T -Z 18 15 -n 100 MyPath/MyImage.CR2
